@@ -5,7 +5,7 @@ This module provides REST endpoints for podcast generation and audio serving,
 with configuration management and temporary file handling.
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, Request
 from fastapi.responses import FileResponse, JSONResponse
 import os
 import shutil
@@ -68,6 +68,23 @@ os.makedirs(TASKS_DIR, exist_ok=True)
 # Task management lock to prevent race conditions
 tasks_lock = threading.Lock()
 
+# Add API key configuration
+API_KEY = os.getenv("API_KEY", "default-api-key")  # You can set a default or require it to be set
+
+async def verify_api_key(request: Request, x_api_key: str = Header(None)):
+    """Middleware to check API key in header"""
+    # Skip authentication for audio and health endpoints
+    if request.url.path.startswith("/audio/") or request.url.path == "/health":
+        return True
+    
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="API Key is missing")
+    
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    
+    return True
+
 
 class PodcastData(BaseModel):
     openai_key: str
@@ -76,6 +93,7 @@ class PodcastData(BaseModel):
     name: str
     tagline: str
     urls: list[str] = []
+    podcast_id: str = f"podcast_{os.urandom(8).hex()}"
 
 
 class TaskResponse(BaseModel):
@@ -210,10 +228,10 @@ def process_podcast_generation(task_id: str, data: PodcastData):
 
 
 @app.post("/generate", response_model=TaskResponse)
-async def generate_podcast_endpoint(data: PodcastData, background_tasks: BackgroundTasks):
+async def generate_podcast_endpoint(data: PodcastData, background_tasks: BackgroundTasks, authorized: bool = Depends(verify_api_key)):
     """Start an asynchronous podcast generation task and return a task ID"""
     # Generate a unique task ID
-    task_id = str(uuid.uuid4())
+    task_id = data.podcast_id
 
     # Initialize task status as pending
     update_task_status(task_id, "pending")
@@ -226,7 +244,7 @@ async def generate_podcast_endpoint(data: PodcastData, background_tasks: Backgro
 
 
 @app.get("/task/{task_id}", response_model=TaskStatus)
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, authorized: bool = Depends(verify_api_key)):
     """Get the current status of a podcast generation task"""
     with tasks_lock:
         tasks = get_tasks()
@@ -240,7 +258,7 @@ async def get_task_status(task_id: str):
 
 
 @app.get("/tasks", response_model=Dict[str, TaskStatus])
-async def get_all_tasks():
+async def get_all_tasks(authorized: bool = Depends(verify_api_key)):
     """Get all tasks (for debugging/monitoring)"""
     with tasks_lock:
         tasks = get_tasks()
