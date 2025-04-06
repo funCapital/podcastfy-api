@@ -30,4 +30,4 @@ ENV HOST=0.0.0.0
 ENV PORT=8082
 
 # Command to run the application
-CMD ["python", "main.py"]
+CMD ["python","-u", "main.py"]
