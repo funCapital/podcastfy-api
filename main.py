@@ -112,8 +112,7 @@ async def generate_podcast_endpoint(data: PodcastGenerationRequest):
 
         # Generate podcast
         result = generate_podcast(
-            urls=data.urls,
-            urls=data.get('urls', []),
+            urls=data.urls or [],
             conversation_config=conversation_config,
             tts_model=tts_model,
             longform=bool(data.get('is_long_form', False)),
