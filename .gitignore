@@ -2,3 +2,4 @@
 .venv
 data
 temp_audio
+__pycache__
