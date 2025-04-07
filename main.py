@@ -5,23 +5,25 @@ This module provides REST endpoints for podcast generation and audio serving,
 with configuration management and temporary file handling.
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 import os
 import shutil
-import json
 import uuid
 import time
-import threading
+from enum import Enum
 from openai import BaseModel
 import yaml
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from podcastfy.client import generate_podcast
 import uvicorn
+from dotenv import load_dotenv
 
+load_dotenv()
 import requests
 
+MAIN_API_SERVER = os.getenv("MAIN_API_SERVER")
 
 def download_content(url: str) -> str:
     response = requests.get(url)
@@ -60,30 +62,18 @@ def merge_configs(base_config: Dict[Any, Any], user_config: Dict[Any, Any]) -> D
 app = FastAPI()
 
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_audio")
-TASKS_DIR = os.path.join(os.path.dirname(__file__), "tasks")
-TASKS_FILE = os.path.join(TASKS_DIR, "tasks.json")
 os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(TASKS_DIR, exist_ok=True)
 
-# Task management lock to prevent race conditions
-tasks_lock = threading.Lock()
 
-# Add API key configuration
-API_KEY = os.getenv("API_KEY", "default-api-key")  # You can set a default or require it to be set
+class PodcastStatus(str, Enum):
+    SUCCESS = "Success"
+    FAILED = "Failed"
 
-async def verify_api_key(request: Request, x_api_key: str = Header(None)):
-    """Middleware to check API key in header"""
-    # Skip authentication for audio and health endpoints
-    if request.url.path.startswith("/audio/") or request.url.path == "/health":
-        return True
-    
-    if not x_api_key:
-        raise HTTPException(status_code=401, detail="API Key is missing")
-    
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    
-    return True
+
+class PodcastStatusRequest(BaseModel):
+    podcast_id: str
+    status: PodcastStatus
+    error: Optional[str] = None
 
 
 class PodcastData(BaseModel):
@@ -98,79 +88,6 @@ class PodcastData(BaseModel):
 
 class TaskResponse(BaseModel):
     task_id: str
-
-
-class TaskStatus(BaseModel):
-    status: str  # "pending", "success", "failed"
-    created_at: float
-    completed_at: Optional[float] = None
-    audioUrl: Optional[str] = None
-    error: Optional[str] = None
-
-
-def get_tasks() -> Dict[str, Dict]:
-    """Load all tasks from the tasks.json file"""
-    if not os.path.exists(TASKS_FILE):
-        return {}
-    
-    try:
-        with open(TASKS_FILE, 'r') as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        # If the file is corrupted, start fresh
-        return {}
-
-
-def save_tasks(tasks: Dict[str, Dict]):
-    """Save tasks to the tasks.json file"""
-    with open(TASKS_FILE, 'w') as f:
-        json.dump(tasks, f, indent=2)
-
-
-def cleanup_old_tasks(tasks: Dict[str, Dict], max_tasks: int = 100) -> Dict[str, Dict]:
-    """Remove old tasks if there are too many"""
-    if len(tasks) <= max_tasks:
-        return tasks
-    
-    # Sort tasks by creation time (oldest first)
-    sorted_tasks = sorted(tasks.items(), key=lambda x: x[1].get('created_at', 0))
-    
-    # Keep only the newest max_tasks
-    tasks_to_keep = dict(sorted_tasks[-max_tasks:])
-    return tasks_to_keep
-
-
-def update_task_status(task_id: str, status: str, audio_url: Optional[str] = None, error: Optional[str] = None):
-    """Update task status in the shared tasks.json file"""
-    with tasks_lock:
-        tasks = get_tasks()
-        
-        if task_id not in tasks:
-            # Initialize new task
-            tasks[task_id] = {
-                "status": status,
-                "created_at": time.time(),
-                "audioUrl": audio_url,
-                "error": error
-            }
-        else:
-            # Update existing task
-            tasks[task_id]["status"] = status
-            
-            if status in ["success", "failed"]:
-                tasks[task_id]["completed_at"] = time.time()
-            
-            if audio_url is not None:
-                tasks[task_id]["audioUrl"] = audio_url
-            
-            if error is not None:
-                tasks[task_id]["error"] = error
-        
-        # Clean up old tasks if needed
-        tasks = cleanup_old_tasks(tasks)
-        
-        # Save updated tasks
-        save_tasks(tasks)
 
 
 def process_podcast_generation(task_id: str, data: PodcastData):
@@ -211,30 +128,41 @@ def process_podcast_generation(task_id: str, data: PodcastData):
         )
 
         # Handle the result
-        filename = f"podcast_{os.urandom(8).hex()}.mp3"
+        filename = f"{task_id}.mp3"
         output_path = os.path.join(TEMP_DIR, filename)
+
+        status_data = {
+            "podcast_id": task_id,
+            "status": PodcastStatus.SUCCESS if result else PodcastStatus.FAILED,
+            "error": None
+        }
 
         if isinstance(result, str) and os.path.isfile(result):
             shutil.copy2(result, output_path)
-            update_task_status(task_id, "success", f"/audio/{filename}")
         elif hasattr(result, 'audio_path'):
             shutil.copy2(result.audio_path, output_path)
-            update_task_status(task_id, "success", f"/audio/{filename}")
         else:
-            update_task_status(task_id, "failed", error="Invalid result format")
+            status_data["status"] = PodcastStatus.FAILED
+            status_data["error"] = "Invalid result format"
+
+        # Call the update_podcast endpoint with the status
+        requests.post(f"{MAIN_API_SERVER}/update_podcast", json=status_data)
 
     except Exception as e:
-        update_task_status(task_id, "failed", error=str(e))
+        # Send error status to the update endpoint
+        status_data = {
+            "podcast_id": task_id,
+            "status": PodcastStatus.FAILED,
+            "error": str(e)
+        }
+        requests.post(f"{MAIN_API_SERVER}/update_podcast", json=status_data)
 
 
 @app.post("/generate", response_model=TaskResponse)
-async def generate_podcast_endpoint(data: PodcastData, background_tasks: BackgroundTasks, authorized: bool = Depends(verify_api_key)):
+async def generate_podcast_endpoint(data: PodcastData, background_tasks: BackgroundTasks):
     """Start an asynchronous podcast generation task and return a task ID"""
     # Generate a unique task ID
     task_id = data.podcast_id
-
-    # Initialize task status as pending
-    update_task_status(task_id, "pending")
 
     # Queue the podcast generation as a background task
     background_tasks.add_task(process_podcast_generation, task_id, data)
@@ -243,33 +171,21 @@ async def generate_podcast_endpoint(data: PodcastData, background_tasks: Backgro
     return {"task_id": task_id}
 
 
-@app.get("/task/{task_id}", response_model=TaskStatus)
-async def get_task_status(task_id: str, authorized: bool = Depends(verify_api_key)):
-    """Get the current status of a podcast generation task"""
-    with tasks_lock:
-        tasks = get_tasks()
-        
-        if task_id not in tasks:
-            raise HTTPException(status_code=404, detail="Task not found")
-        
-        task_data = tasks[task_id]
+@app.post("/update_podcast")
+async def update_podcast_status(data: PodcastStatusRequest):
+    """Receive status updates for podcast generation"""
+    # This endpoint would be called by your system when a podcast
+    # generation succeeds or fails
     
-    return TaskStatus(**task_data)
+    # You could implement any processing logic here
+    # but for now just return acknowledgment
+    return {"received": True, "podcast_id": data.podcast_id, "status": data.status}
 
 
-@app.get("/tasks", response_model=Dict[str, TaskStatus])
-async def get_all_tasks(authorized: bool = Depends(verify_api_key)):
-    """Get all tasks (for debugging/monitoring)"""
-    with tasks_lock:
-        tasks = get_tasks()
-    
-    return tasks
-
-
-@app.get("/audio/{filename}")
-async def serve_audio(filename: str):
+@app.get("/podcasts/{podcast_id}")
+async def serve_audio(podcast_id: str):
     """ Get File Audio From ther Server"""
-    file_path = os.path.join(TEMP_DIR, filename)
+    file_path = os.path.join(TEMP_DIR, podcast_id + ".mp3")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path)
@@ -278,6 +194,7 @@ async def serve_audio(filename: str):
 @app.get("/health")
 async def healthcheck():
     return {"status": "healthy"}
+
 
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
