@@ -9,12 +9,10 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 import os
 import shutil
-import uuid
-import time
 from enum import Enum
 from openai import BaseModel
 import yaml
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from pathlib import Path
 from podcastfy.client import generate_podcast
 import uvicorn
@@ -32,7 +30,7 @@ def download_content(url: str) -> str:
 
 
 def load_base_config() -> Dict[Any, Any]:
-    config_path = Path(__file__).parent / "podcastfy" / \
+    config_path = Path(__file__).parent / \
         "conversation_config.yaml"
     try:
         with open(config_path, 'r') as file:
@@ -66,12 +64,12 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 class PodcastStatus(str, Enum):
-    SUCCESS = "Success"
-    FAILED = "Failed"
+    SUCCESS = "success"
+    FAILED = "failed"
 
 
 class PodcastStatusRequest(BaseModel):
-    podcast_id: str
+    podcastId: str
     status: PodcastStatus
     error: Optional[str] = None
 
@@ -80,8 +78,9 @@ class PodcastData(BaseModel):
     openai_key: str
     google_key: str
     elevenlabs_key: str = ""
-    name: str
-    tagline: str
+    tagline: str = ""
+    # webhook url to send the status of the podcast when done
+    webhook_url: str
     urls: list[str] = []
     podcast_id: str = f"podcast_{os.urandom(8).hex()}"
 
@@ -101,7 +100,6 @@ def process_podcast_generation(task_id: str, data: PodcastData):
         base_config = load_base_config()
 
         user_config = {
-            'podcast_name': data.name,
             'podcast_tagline': data.tagline,
         }
 
@@ -117,11 +115,22 @@ def process_podcast_generation(task_id: str, data: PodcastData):
             combined_content = "\n\n".join(downloaded_contents)
         else:
             combined_content = ""
+        transcript_path = generate_podcast(
+            urls=data.urls,
+            text=combined_content,
+            conversation_config=conversation_config,
+            tts_model=tts_model,
+            longform=False,
+            transcript_only=True,
+        )
+        
+        with open(os.path.join(TEMP_DIR, f"{task_id}.txt"), "w") as f:
+            f.write(transcript_path)
+
 
         # Generate podcast
         result = generate_podcast(
-            urls=data.urls,
-            text=combined_content,
+            transcript_file=transcript_path,
             conversation_config=conversation_config,
             tts_model=tts_model,
             longform=False,
@@ -132,7 +141,7 @@ def process_podcast_generation(task_id: str, data: PodcastData):
         output_path = os.path.join(TEMP_DIR, filename)
 
         status_data = {
-            "podcast_id": task_id,
+            "podcastId": task_id,
             "status": PodcastStatus.SUCCESS if result else PodcastStatus.FAILED,
             "error": None
         }
@@ -146,16 +155,18 @@ def process_podcast_generation(task_id: str, data: PodcastData):
             status_data["error"] = "Invalid result format"
 
         # Call the update_podcast endpoint with the status
-        requests.post(f"{MAIN_API_SERVER}/update_podcast", json=status_data)
+        print(f"Calling {data.webhook_url} with status: {status_data}")
+        print(requests.post(f"{data.webhook_url}", json=status_data).text)
 
     except Exception as e:
         # Send error status to the update endpoint
         status_data = {
-            "podcast_id": task_id,
+            "podcastId": task_id,
             "status": PodcastStatus.FAILED,
             "error": str(e)
         }
-        requests.post(f"{MAIN_API_SERVER}/update_podcast", json=status_data)
+        print(f"Calling {data.webhook_url} with status: {status_data}")
+        print(requests.post(f"{data.webhook_url}", json=status_data).text)
 
 
 @app.post("/generate", response_model=TaskResponse)
@@ -190,6 +201,23 @@ async def serve_audio(podcast_id: str):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path)
 
+
+@app.get("/transcripts/{podcast_id}")
+async def serve_transcript(podcast_id: str):
+    """ Get Transcript From the Server"""
+    reference_file_path = os.path.join(TEMP_DIR, f"{podcast_id}.txt")
+    
+    if not os.path.exists(reference_file_path):
+        raise HTTPException(status_code=404, detail="Transcript reference not found")
+    
+    # Read the file path from the reference file
+    with open(reference_file_path, "r") as file:
+        actual_transcript_path = file.read().strip()
+    
+    if not os.path.exists(actual_transcript_path):
+        raise HTTPException(status_code=404, detail="Transcript file not found")
+    
+    return FileResponse(actual_transcript_path)
 
 @app.get("/health")
 async def healthcheck():
