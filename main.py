@@ -17,6 +17,7 @@ from pathlib import Path
 from podcastfy.client import generate_podcast
 import uvicorn
 from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 import requests
@@ -56,8 +57,19 @@ def merge_configs(base_config: Dict[Any, Any], user_config: Dict[Any, Any]) -> D
 
     return merged
 
+origins = [
+    "*"
+]
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_audio")
 os.makedirs(TEMP_DIR, exist_ok=True)
